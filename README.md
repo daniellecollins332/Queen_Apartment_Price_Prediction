@@ -4,7 +4,7 @@ Overview
 This project uses a dataset of condo and co-op sales in Queens, NY (Feb 2016 – Feb 2017) collected via Amazon MTurk. The data is raw and messy — a significant portion of the work involved cleaning, featurizing, and handling missingness before any modeling.
 
 ## Models Built:-
-ModelDescriptionRegression TreeSingle decision tree; top 10 features visualizedOLS Linear RegressionBaseline linear model with coefficient interpretationRandom ForestPrimary production model; OOB error used for validation
+ModelDescriptions: Single Regression Decision: top 10 features visualized, OLS Linear Regression: Baseline linear model with coefficient interpretation, Random Forest Primary production model: OOB error used for validation
 
 ## Results:-
 
