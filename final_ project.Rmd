@@ -1,0 +1,708 @@
+---
+title: "Math 342W Final Project — Queens Apartment Price Prediction"
+author: "Danielle Collins"
+date: "May 26th 2026"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Packages & Setup
+
+```{r}
+
+## Core Libaries
+library(tidyverse)
+library(magrittr)
+
+install.packages("stringr")
+library(stringr)
+
+## Modeling
+install.packages("rJava")
+install.packages("devtools")
+devtools::install_github("kapelner/YARF/YARFJARs", ref = "dev")
+devtools::install_github("kapelner/YARF/YARF", ref = "dev")
+
+
+options(java.parameters = "-Xmx4000m")
+install.packages("pacman")
+library(pacman)
+pacman::p_load(rJava)
+library(rJava)
+.jinit()
+
+if (!pacman::p_isinstalled(YARF)){
+  pacman::p_install_gh("kapelner/YARF/YARFJARs", ref = "dev")
+  pacman::p_install_gh("kapelner/YARF/YARF", ref = "dev", force = TRUE)
+}
+pacman::p_load(YARF)
+
+library(YARF)        # regression tree + random forest
+library(rpart)       # fallback tree visualization
+library(rpart.plot)
+
+# Table formatting
+library(knitr)
+library(kableExtra)
+
+# Missingness
+library(missForest)  # for imputation (optional)
+library(naniar)      # missingness summaries
+
+set.seed(342)
+```
+
+---------------------------------------------
+
+##Loading Our Data
+
+```{r}
+housing= read.csv("housing_data_2016_2017.csv", stringsAsFactors = FALSE)
+
+dim (housing)
+names(housing)
+
+cat("Rows:", nrow(housing), "\n")
+cat("Columns:", ncol(housing), "\n")
+
+```
+##Understanding Our Data 
+
+```{r load-data}
+##since coop_condo is our apartment type filter, we first check what the apartment type values are 
+
+table(housing$coop_condo, useNA="always")
+
+##Let's look at how our zip codes are stored
+head(housing$full_address_or_zip_code,20)
+
+##Check sale prices
+summary(housing$sale_price)
+head(housing$sale_price,20)
+
+##Examine rest of data
+
+table(housing$garage_exists,useNA="always")
+##"yes", "Yes", "eys", "Underground", "UG",and "1" most likely all mean the same thing. "NA" probably means no garage
+
+table(housing$cats_allowed, useNA="always")
+##cats_allowed has "y" and "yes" as separate values
+
+table(housing$dogs_allowed, useNA="always")
+##dogs_allowed has "yes89"and "yes" as seperate values, we'll combine them as "yes"
+
+table(housing$fuel_type, useNA="always")
+##fuel_type has "other" and "Other" as separate values
+
+table(housing$kitchen_type, useNA="always")
+##kitchen_type has "combo" and "Combo" as separate values, along with: "eat in", "Eat In" and "eatin" and also "efficiemcy", "efficiency", "efficiency kitchen","efficiency kitchene" and "efficiency ktchen"
+
+table(housing$dining_room_type, useNA="always")
+table(housing$community_district_num, useNA = "always")
+
+summary(housing$total_taxes)
+summary(housing$parking_charges)
+summary(housing$num_floors_in_building)
+summary(housing$sq_footage)
+summary(housing$num_bedrooms)
+summary(housing$num_full_bathrooms)
+summary(housing$approx_year_built)
+summary(housing$walk_score)
+summary(housing$maintenance_cost)
+summary(housing$common_charges)
+summary(housing$listing_price_to_nearest_1000)
+summary(housing$num_floors_in_building)
+summary(housing$num_half_bathrooms)
+summary(housing$parking_charges)
+summary(housing$pct_tax_deductibl)
+summary(housing$total_taxes)
+```
+As can be seen from above, we have a lot of cleaning to do in our dataset before we can perform any modeling on it. Not only do we have missing values, but many features contain typos and duplicate values.
+
+##Cleaning Our Data
+
+```{r}
+## our zip codes are stuck in address string, so we need to extract them
+
+housing$zipcode= as.integer(stringr::str_extract(housing$full_address_or_zip_code, "\\d{5}"))
+## taking anywhere we see 5 digits in a row
+
+##Change sale price to numeric from string
+housing$sale_price= as.numeric(gsub("[$,\\s]", "", housing$sale_price))
+##gsub finds every match of a pattern in a string and replaces it- finding "$" and "," and removing it then turning final result into a number
+
+##Change listing price to numeric from string
+housing$listing_price_to_nearest_1000= as.numeric(gsub("[$,\\s]", "", housing$listing_price_to_nearest_1000))
+##gsub finds every match of a pattern in a string and replaces it- finding "$" and "," and removing it then turning final result into a number
+
+##Change total taxes to numeric from string
+housing$total_taxes <- as.numeric(gsub("[$,\\s]", "", housing$total_taxes))
+
+##Change parking charges to numeric from string
+housing$parking_charges <- as.numeric(gsub("[$,\\s]", "", housing$parking_charges))
+
+##Change maintenance cost to numeric
+housing$maintenance_cost= as.numeric(gsub("[$,\\s]", "", housing$maintenance_cost))
+
+##Change common charges to numeric
+housing$common_charges= as.numeric(gsub("[$,\\s]", "", housing$common_charges))
+
+##Now we have to deal with our typos and duplicates in feature values
+
+## Standardizing cats_allowed
+housing$cats_allowed = ifelse(housing$cats_allowed=="y","yes", housing$cats_allowed)
+housing$cats_allowed <- tolower(housing$cats_allowed)
+##Replaces y with yes, and for entries with "Yes" or "No", changes to standard "yes" or "no"
+
+## Standardizing dogs_allowed 
+housing$dogs_allowed = ifelse(housing$dogs_allowed=="yes89","yes", housing$dogs_allowed)
+housing$dogs_allowed= tolower(housing$dogs_allowed)
+
+##Standardizing fuel_type
+housing$fuel_type <- tolower(housing$fuel_type)
+
+##Standardizing kitchen type
+housing$kitchen_type= tolower(housing$kitchen_type)
+housing$kitchen_type= ifelse(housing$kitchen_type %in% c("efficiemcy", "efficiency kitchen", "efficiency kitchene", "efficiency ktchen", "efficiency"), "efficiency", housing$kitchen_type)
+housing$kitchen_type=ifelse(housing$kitchen_type=="1955", NA, housing$kitchen_type)
+housing$kitchen_type= ifelse(housing$kitchen_type %in% c("combo", "Combo"), "combo", housing$kitchen_type)
+housing$kitchen_type= ifelse(housing$kitchen_type== "eatin", "eat in", housing$kitchen_type)
+
+##Standardizing dining_room_type
+
+housing$dining_room_type = as.character(housing$dining_room_type)
+housing$dining_room_type <- ifelse(housing$dining_room_type == "dining area","other", housing$dining_room_type)
+##Changes the 2 entries that say "dining area" to "other"
+
+##Standardizing garage exists
+housing$garage_exists= tolower(housing$garage_exists)
+housing$garage_exists= ifelse(housing$garage_exists %in% c("yes", "eys", "ug", "underground", "1"), "yes", housing$garage_exists)
+housing$garage_exists= ifelse(is.na(housing$garage_exists), "no", housing$garage_exists)
+
+
+summary(housing$sale_price)
+summary(housing$maintenance_cost)
+summary(housing$common_charges)
+summary(housing$listing_price_to_nearest_1000)
+summary(housing$total_taxes)
+summary(housing$parking_charges)
+summary(housing$num_floors_in_building)
+table(housing$cats_allowed, useNA= "always")
+table(housing$dogs_allowed, useNA= "always")
+table(housing$fuel_type, useNA= "always")
+table(housing$kitchen_type, useNA= "always")
+table(housing$dining_room_type, useNA="always")
+table(housing$garage_exists, useNA= "always")
+table(housing$zipcode, useNA= "always")
+table(housing$community_district_num, useNA = "always")
+
+```
+
+Now pay close attention to the zip codes. Upon closer inspection, we see that there are a few zip codes that do not belong to the Queens Borough. As a matter of fact, they're not even valid zip codes! Also, there are 15 addresses in which we can not find any zip codes for. Hence, our focus below will be on filtering our dataset to extract only those rows/observations with correct zip codes.
+
+```{r}
+valid_zipcodes= c(11361, 11362, 11363, 11364, 11354, 11355, 11356, 11357, 11358, 11359, 11360,11365, 11366, 11367,11412, 11423, 11432, 11433, 11434, 11435, 11436, 11101, 11102, 11103, 11104, 11105, 11106,11374, 11375, 11379, 11385,11004, 11005, 11411, 11413, 11422, 11426, 11427, 11428, 11429,11414, 11415, 11416, 11417, 11418, 11419, 11420, 11421,11368, 11369, 11370, 11372, 11373, 11377, 11378)
+
+
+##Formatting dataset as how project specified
+housing= housing %>% filter(zipcode %in% valid_zipcodes, coop_condo %in% c("co-op", "condo"), !is.na(sale_price), sale_price<=1000000, sale_price>0)
+
+
+## Now lets check if we have any duplicate addresses in our filtered dataset (same address listed with same price, not referring to multiple units in a building)
+dup_addresses <- housing$full_address_or_zip_code[
+  duplicated(housing$full_address_or_zip_code)
+]
+cat("Number of duplicate addresses:", length(dup_addresses), "\n")
+
+## View duplicates with sale price and date
+result = housing[housing$full_address_or_zip_code %in% dup_addresses,
+        c("full_address_or_zip_code", "sale_price", "date_of_sale")]
+result= result[order(result$full_address_or_zip_code), ]
+print(result)
+
+## Remove true duplicates (same address, same price, same date)
+housing= housing[!duplicated(
+  paste(housing$full_address_or_zip_code, housing$sale_price, housing$date_of_sale)
+), ]
+
+##reset row numbers
+rownames(housing) <- NULL
+
+cat("Rows after removing duplicates:", nrow(housing), "\n")
+
+dim(housing)
+summary(housing$sale_price)
+
+```
+
+##Featurization
+Now we have much less observations to work with, 518 to be exact, and also 57 features. As we saw in the beginning of this project, the number 57 comes from the MTurk metadata columns we have not gotten rid of yet. Also, we now need to officially select our desired features for our model. In the section below, we will focus addressing these matters collectively for a more meaningful dataset.
+
+```{r}
+
+housing= housing %>% mutate(age_at_sale= 2016- approx_year_built,
+      ##converting yes/no features into binary and categorizing others
+      garage_exists=ifelse(garage_exists=="yes",1,0),
+                            
+      is_coop=ifelse(coop_condo== "co-op",1,0),
+
+      cats_allowed= ifelse(cats_allowed=="yes",1,0), 
+
+      dogs_allowed = ifelse(dogs_allowed == "yes", 1, 0) ,
+
+      kitchen_type = as.factor(kitchen_type), 
+
+      dining_room_type = as.factor(dining_room_type),
+
+      fuel_type = as.factor(fuel_type)
+
+)
+
+housing$community_district_num= as.factor(housing$community_district_num)
+
+##Now, in addition to the features provided by our dataset, to achieve the most accurate model possible, we will introduce some external features (i.e. features related to our dataset but not currently in it). The values were extracted via national data collection during the time period of 2016-1017 relative to each zip code.
+
+##Mean Income by Zipcode
+mean_income_by_zip= data.frame(zips=c( 11004, 11101, 11102, 11103, 11104, 11105, 11106, 11109,
+    11354, 11355, 11356, 11357, 11358, 11360, 11361, 11362,
+    11363, 11364, 11365, 11366, 11367, 11368, 11369, 11370,
+    11372, 11373, 11374, 11375, 11377, 11378, 11379, 11385,
+    11411, 11412, 11413, 11414, 11415, 11416, 11417, 11418,
+    11419, 11420, 11421, 11422, 11423, 11426, 11427, 11428,
+    11429, 11432, 11433, 11434, 11435, 11436, 11691, 11692,
+    11693, 11694, 11697
+  ),
+  mean_income = c(
+    91500, 67000, 62000, 64000, 60000, 80000, 58500, 125000,
+    53000, 50000, 76000, 98500, 85000, 88500, 86000, 100000,
+    110000, 82000, 73000, 78000, 68000, 41500, 49500, 61000,
+    55000, 48000, 66000, 80000, 59000, 73000, 85000, 57000,
+    78000, 74000, 70000, 85000, 66000, 57000, 59000, 55000,
+    53000, 59000, 57000, 78000, 67000, 90000, 78000, 76000,
+    74000, 53000, 46000, 48000, 44000, 53000, 40000, 47000,
+    69000, 86000, 122500
+  )
+  )
+
+housing$mean_income= mean_income_by_zip$mean_income[
+  match(housing$zipcode, mean_income_by_zip$zips)]
+
+## Check it worked
+sum(is.na(housing$mean_income))
+summary(housing$mean_income)
+
+
+# Grouping community districts- Why?
+## Several districts have only 1 observation — districts 3, 4, 8, 16, 19, 20, 23 all have just 1 row each. These will randomly end up only in the test fold in later sections, resulting in errors.
+
+housing$community_district_num <- as.character(housing$community_district_num)
+housing$community_district_num <- ifelse(
+  housing$community_district_num %in% c("24", "25", "26", "27", "28", "29", "30"),
+  housing$community_district_num,
+  "Other"
+)
+housing$community_district_num <- as.factor(housing$community_district_num)
+
+table(housing$community_district_num)
+
+
+##Crime Ranking by Zipcode
+crime_by_zip <- data.frame(
+  zips = c(
+    11004, 11101, 11102, 11103, 11104, 11105, 11106, 11109,
+    11354, 11355, 11356, 11357, 11358, 11360, 11361, 11362,
+    11363, 11364, 11365, 11366, 11367, 11368, 11369, 11370,
+    11372, 11373, 11374, 11375, 11377, 11378, 11379, 11385,
+    11411, 11412, 11413, 11414, 11415, 11416, 11417, 11418,
+    11419, 11420, 11421, 11422, 11423, 11426, 11427, 11428,
+    11429, 11432, 11433, 11434, 11435, 11436, 11691, 11692,
+    11693, 11694, 11697
+  ),
+  crime_rate = factor(c(
+    "Very Safe", "High", "Moderate", "Moderate", "Moderate", "Safe", "Moderate", "Safe",
+    "Moderate", "Moderate", "Safe", "Very Safe", "Very Safe", "Very Safe", "Very Safe", "Very Safe",
+    "Extremely Safe", "Very Safe", "Safe", "Safe", "Safe", "High", "Moderate-High", "Moderate-High",
+    "Moderate-High", "High", "Safe", "Safe", "Moderate", "Safe", "Very Safe", "Moderate-High",
+    "Safe", "Safe", "Moderate", "Safe", "Safe", "Moderate", "Moderate", "Moderate",
+    "Moderate", "Moderate", "Moderate", "Safe", "Moderate", "Very Safe", "Safe", "Safe",
+    "Safe", "Moderate-High", "High", "High", "High", "Moderate-High", "High", "Moderate-High",
+    "Moderate", "Safe", "Extremely Safe"
+  ), levels = c("Extremely Safe", "Very Safe", "Safe", "Moderate", "Moderate-High", "High"))
+)
+
+housing$crime_rate= crime_by_zip$crime_rate[
+  match(housing$zipcode, crime_by_zip$zips)]
+
+sum(is.na(housing$crime_rate))
+table(housing$crime_rate)
+
+housing$neighborhood <- ifelse(housing$zipcode %in% c(11361, 11362, 11363, 11364), "Northeast Queens",
+                        ifelse(housing$zipcode %in% c(11354, 11355, 11356, 11357, 11358, 11359, 11360), "North Queens",
+                        ifelse(housing$zipcode %in% c(11365, 11366, 11367), "Central Queens",
+                        ifelse(housing$zipcode %in% c(11412, 11423, 11432, 11433, 11434, 11435, 11436), "Jamaica",
+                        ifelse(housing$zipcode %in% c(11101, 11102, 11103, 11104, 11105, 11106), "Northwest Queens",
+                        ifelse(housing$zipcode %in% c(11374, 11375, 11379, 11385), "West Central Queens",
+                        ifelse(housing$zipcode %in% c(11004, 11005, 11411, 11413, 11422, 11426, 11427, 11428, 11429), "Southeast Queens",
+                        ifelse(housing$zipcode %in% c(11414, 11415, 11416, 11417, 11418, 11419, 11420, 11421), "Southwest Queens",
+                        ifelse(housing$zipcode %in% c(11368, 11369, 11370, 11372, 11373, 11377, 11378), "West Queens", NA)))))))))
+
+housing$neighborhood <- as.factor(housing$neighborhood)
+
+
+table(housing$neighborhood)
+sum(is.na(housing$neighborhood))
+
+##Monthly Inflation Rate
+
+## Extract month and year from date_of_sale
+housing$sale_month <- as.integer(format(as.Date(housing$date_of_sale, "%m/%d/%Y"), "%m"))
+housing$sale_year  <- as.integer(format(as.Date(housing$date_of_sale, "%m/%d/%Y"), "%Y"))
+
+## US Monthly CPI (All Urban Consumers, 2016-2017)
+cpi_data = data.frame(
+  year  = c(2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2016, 2017, 2017),
+  month = c(2,    3,    4,    5,    6,    7,    8,    9,    10,   11,   12,   1,    2),
+  cpi   = c(236.9, 238.1, 239.3, 240.2, 241.0, 240.6, 240.8, 241.4, 241.7, 241.4, 241.4, 242.8, 243.6)
+)
+
+housing$cpi= cpi_data$cpi[
+  match(paste(housing$sale_year, housing$sale_month), 
+        paste(cpi_data$year, cpi_data$month))
+]
+
+sum(is.na(housing$cpi))
+summary(housing$cpi)
+
+## ---- Missingness Indicators ----
+## Added before imputation so we capture which values were truly missing
+## sq_footage and common_charges have very high missingness (60% and 75%), may be informative 
+
+housing$sq_footage_missing <- as.integer(is.na(housing$sq_footage))
+housing$common_charges_missing <- as.integer(is.na(housing$common_charges))
+housing$maintenance_cost_missing <- as.integer(is.na(housing$maintenance_cost))
+housing$num_floors_missing <- as.integer(is.na(housing$num_floors_in_building))
+
+cat("sq_footage missing:", sum(housing$sq_footage_missing), "\n")
+cat("common_charges missing:", sum(housing$common_charges_missing), "\n")
+cat("maintenance_cost missing:", sum(housing$maintenance_cost_missing), "\n")
+cat("num_floors missing:", sum(housing$num_floors_missing), "\n")
+
+##now selecting our total final features
+
+features = c(
+  "sq_footage", 
+  "age_at_sale",
+  "num_bedrooms",
+  "num_full_bathrooms",
+  "num_total_rooms", 
+  "is_coop", 
+  "garage_exists",
+  "cats_allowed", 
+  "dogs_allowed",
+  "kitchen_type", 
+  "dining_room_type", 
+  "fuel_type", 
+  "maintenance_cost",
+  "common_charges", 
+  "walk_score",
+  "mean_income", 
+  "crime_rate",
+  "neighborhood",
+  "cpi",
+  "num_floors_in_building", "community_district_num",
+  "sq_footage_missing", "common_charges_missing", 
+  "maintenance_cost_missing", "num_floors_missing"
+  )
+
+##Of note listing price was considered to be used as a feature originally to help estimate sale price as an approximation however:
+
+## Check how many rows have both
+both= sum(!is.na(housing$sale_price) & !is.na(housing$listing_price_to_nearest_1000))
+cat("Rows with both sale price and listing price:", both, "\n")
+##Therefore we will instead drop listing_price as a feature as there is no overlap between the two variables, every row either has a listing price or a sale price, never both. Since we need sale price as our outcome variable, we are restricted to the 521 rows that have it, and all of those rows have no listing price whatsoever. With 100% missingness in listing price across our modeling dataset, there is no information to impute from and no way to learn the relationship between listing price and sale price. We therefore drop it as a feature.
+
+
+cat("Number of features:", length(features), "\n")
+##Total features
+dim(housing[,features])
+
+##Our matrix has 521 observations(rows),18 features (columns)
+summary(housing[,features])
+
+"mean_income" %in% names(housing)
+names(housing)
+
+table(housing$neighborhood)
+sum(is.na(housing$neighborhood))
+
+##A few things to note: sq_footage and common_charges have 312 and 390 NAs respectively (over half of our observations), maintenance_cost has 140 NAs, kitchen_type- 7 NAs, dining_room_type- 115 NAs, age_at_sale- 6 NAs
+
+```
+
+##Imputation
+
+That missingness we noted in the previous section is now our main point of focus in this one."Imputation" refers to the process of "filling in" missing values in a dataset with estimated or predicted values. Its purpose: To ensure completeness and improve our analysis' accuracy.
+
+Usually, we would make use of the column mean as our estimated value. However, instead we pivot to using the column median due to cases such as the following: sq_footage has a max of 6215 which is much higher than its mean of 958, meaning that outlier would greatly pull our mean up and give us an unrealistic imputed value for square footage. 
+
+For categorical features, we will use the mode as our estimated value.
+
+```{r}
+
+##Imputation via missForest 
+library(missForest)
+
+## Select only our feature columns for imputation
+housing_for_imputation <- housing[, features]
+
+## Run missForest
+imputed <- missForest(housing_for_imputation)
+
+## Replace feature columns with imputed values
+housing[, features] <- imputed$ximp
+
+## Check OOB imputation error
+cat("missForest OOB imputation error:\n")
+print(imputed$OOBerror)
+
+## Confirm no NAs remain
+cat("NAs remaining after missForest:", sum(is.na(housing[, features])), "\n")
+
+```
+##K-Fold Cross Validation
+
+```{r}
+
+## Final cross validation with all three models using tuned parameters
+# mtry = 11 and num_trees = 500 were determined via tuning (see tuning section below)
+
+set.seed(342)
+
+n = nrow(housing)
+k = 5
+fold_idx <- sample(rep(1:k, length.out = n))
+
+cat("n:", n, "\n")
+cat("Fold sizes:\n")
+print(table(fold_idx))
+
+ols_rmse_folds  = c()
+ols_r2_folds    = c()
+tree_rmse_folds = c()
+tree_r2_folds   = c()
+rf_rmse_folds   = c()
+rf_r2_folds     = c()
+
+for (fold in 1:k) {
+  
+  test_idx  = which(fold_idx == fold)
+  train_idx = which(fold_idx != fold)
+  
+  X_train = housing[train_idx, features]
+  y_train = housing$sale_price[train_idx]
+  X_test  = housing[test_idx, features]
+  y_test  = housing$sale_price[test_idx]
+  
+  # --- OLS ---
+  ols_model = lm(sale_price ~ ., data = cbind(X_train, sale_price = y_train))
+  ols_preds = predict(ols_model, X_test)
+  ols_rmse_folds[fold] = sqrt(mean((y_test - ols_preds)^2))
+  ols_r2_folds[fold]   = 1 - sum((y_test - ols_preds)^2) / sum((y_test - mean(y_test))^2)
+  
+  # --- Regression Tree ---
+  tree_model = YARFCART(X_train, y_train)
+  tree_preds = predict(tree_model, X_test)
+  tree_rmse_folds[fold] = sqrt(mean((y_test - tree_preds)^2))
+  tree_r2_folds[fold] = 1 - sum((y_test - tree_preds)^2) / sum((y_test - mean(y_test))^2)
+  
+  # --- Random Forest (tuned) ---
+  rf_model = YARF(X_train, y_train, num_trees = 500, mtry = 17)
+  rf_preds = predict(rf_model, X_test)
+  rf_rmse_folds[fold] = sqrt(mean((y_test - rf_preds)^2))
+  rf_r2_folds[fold] = 1 - sum((y_test - rf_preds)^2) / sum((y_test - mean(y_test))^2)
+  
+  cat("Fold", fold, "complete\n")
+}
+
+cat("\n--- 5-Fold Cross Validation Results ---\n")
+cat("OLS  RMSE:", round(mean(ols_rmse_folds), 2),  "R²:", round(mean(ols_r2_folds), 4), "\n")
+cat("Tree RMSE:", round(mean(tree_rmse_folds), 2), "R²:", round(mean(tree_r2_folds), 4), "\n")
+cat("RF   RMSE:", round(mean(rf_rmse_folds), 2),   "R²:", round(mean(rf_r2_folds),  4), "\n")
+
+
+mean_sale_price = mean(housing$sale_price)
+
+cat("\n--- Normalized RMSE (as proportion of mean sale price) ---\n")
+cat("Mean sale price:", round(mean_sale_price, 2), "\n")
+cat("OLS  Normalized RMSE:", round(mean(ols_rmse_folds) / mean_sale_price, 4), "\n")
+cat("Tree Normalized RMSE:", round(mean(tree_rmse_folds) / mean_sale_price, 4), "\n")
+cat("RF   Normalized RMSE:", round(mean(rf_rmse_folds) / mean_sale_price, 4), "\n")
+
+```
+## Tuning section for mtry and ntrees
+```{r}
+##Mtry
+n = nrow(housing)
+k = 5
+fold_idx <- sample(rep(1:k, length.out = n))
+
+cat("n:", n, "\n")
+cat("Fold sizes:\n")
+print(table(fold_idx))
+
+mtry_values = c(9,11, 13, 15, 17, 19)
+mtry_rmse = c()
+
+for (m in mtry_values) {
+  rmse_folds =  c()
+  
+  for (fold in 1:k) {
+    test_idx  = which(fold_idx == fold)
+    train_idx = which(fold_idx != fold)
+    
+    X_train = housing[train_idx, features]
+    y_train = housing$sale_price[train_idx]
+    X_test  = housing[test_idx, features]
+    y_test  = housing$sale_price[test_idx]
+    
+    rf = YARF(X_train, y_train, num_trees = 500, mtry = m)
+    preds = predict(rf, X_test)
+    rmse_folds[fold] = sqrt(mean((y_test - preds)^2))
+  }
+  
+  mtry_rmse = c(mtry_rmse, mean(rmse_folds))
+  cat("mtry =", m, "RMSE:", round(mean(rmse_folds), 2), "\n")
+}
+
+optimal_mtry =  mtry_values[which.min(mtry_rmse)]
+cat("\nBest mtry:", optimal_mtry, "\n")
+
+##Ntrees
+
+ntree_values = c(250, 500, 750, 1000)
+ntree_rmse <- c()
+
+for (nt in ntree_values) {
+  rmse_folds = c()
+  
+  for (fold in 1:k) {
+    test_idx  = which(fold_idx == fold)
+    train_idx = which(fold_idx != fold)
+    
+    X_train = housing[train_idx, features]
+    y_train = housing$sale_price[train_idx]
+    X_test  = housing[test_idx, features]
+    y_test  = housing$sale_price[test_idx]
+    
+    rf = YARF(X_train, y_train, num_trees = nt, mtry = optimal_mtry)
+    preds = predict(rf, X_test)
+    rmse_folds[fold] = sqrt(mean((y_test - preds)^2))
+  }
+  
+  ntree_rmse = c(ntree_rmse, mean(rmse_folds))
+  cat("num_trees =", nt, "RMSE:", round(mean(rmse_folds), 2), "\n")
+}
+
+optimal_ntrees = ntree_values[which.min(ntree_rmse)]
+cat("\nBest num_trees:", optimal_ntrees, "\n")
+```
+##Final Fit on Dataset
+```{r}
+X_full = housing[,features]
+y_full = housing$sale_price
+
+##Final OLS
+final_ols= lm(sale_price~.,data=cbind(X_full,sale_price=y_full))
+summary(final_ols)
+
+##Final Regression Tree
+final_tree = YARFCART(X_full, y_full)
+
+##Final Random Forest
+final_rf= YARF(X_full, y_full, num_trees=500, mtry=11, calculate_oob_error = TRUE)
+
+cat("RF OOB RMSE:", round(final_rf$rmse_oob, 2), "\n")
+cat("RF OOB R²:  ", round(final_rf$pseudo_rsq_oob, 4), "\n")
+```
+
+##Visualizing Regression Tree for Interpretation
+```{r}
+illustrate_trees(final_tree, max_depth = 4, open_file = TRUE)
+
+tree_rpart = rpart(sale_price ~ ., data = cbind(X_full, sale_price = y_full), control = rpart.control(maxdepth = 6))
+
+var_imp = tree_rpart$variable.importance
+var_imp_df = data.frame(
+  Feature = names(var_imp),
+  Importance = round(var_imp, 2)
+) %>% arrange(desc(Importance))
+
+kable(head(var_imp_df, 10),
+      caption = "Top 10 Features by Variable Importance (Regression Tree)") %>%
+  kable_styling(font_size = 9)
+
+```
+
+### Variable Importance for Random Forest
+
+```{r}
+
+var_counts = query_variable_counts(final_rf)
+var_counts_df = data.frame(feature = names(var_counts), count = as.numeric(var_counts)) %>% arrange(desc(count))
+
+## Bar Plot
+barplot(head(var_counts_df$count, 10),
+  names.arg = head(var_counts_df$Feature, 10),
+  las = 2,
+  main = "Random Forest Variable Importance (Split Count)",
+  ylab = "Number of Splits",
+  col = "steelblue",
+  cex.names = 0.7
+)
+
+## Table
+kable(head(var_counts_df, 10),
+      caption = "Top 10 Features by Split Count (Random Forest)") %>% kable_styling(font_size = 9)
+
+
+```
+
+##Final Performance Results
+```{r}
+results = data.frame(
+  Model = c("Regression Tree", "OLS Linear", "Random Forest"),
+  `In-Sample R2` = c(
+    round(1 - sum((y_full - predict(final_tree, X_full))^2) / sum((y_full - mean(y_full))^2), 4),
+    round(summary(final_ols)$r.squared, 4),
+    round(1 - sum((y_full - predict(final_rf, X_full))^2) / sum((y_full - mean(y_full))^2), 4)
+  ),
+  `In-Sample RMSE` = c(
+    round(sqrt(mean((y_full - predict(final_tree, X_full))^2)), 2),
+    round(sqrt(mean((y_full - predict(final_ols, X_full))^2)), 2),
+    round(sqrt(mean((y_full - predict(final_rf, X_full))^2)), 2)
+  ),
+  `OOS R2` = c(
+    round(mean(tree_r2_folds), 4),
+    round(mean(ols_r2_folds), 4),
+    round(mean(rf_r2_folds), 4)
+  ),
+  `OOS RMSE` = c(
+    round(mean(tree_rmse_folds), 2),
+    round(mean(ols_rmse_folds), 2),
+    round(mean(rf_rmse_folds), 2)
+  ),
+  check.names = FALSE
+)
+
+kable(results,
+      caption = "Model Performance: In-Sample vs Out-of-Sample",
+      align = "lcccc") %>%
+  kable_styling(full_width = FALSE)
+
+```
